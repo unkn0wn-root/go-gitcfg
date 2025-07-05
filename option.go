@@ -1,10 +1,13 @@
-package gogitcfg
+package gitcfg
 
 import (
     "fmt"
     "time"
     "context"
 )
+
+const DefaultTimeout = 30 * time.Second
+
 type configOptions struct {
 	includeSystem   bool
 	includeGlobal   bool

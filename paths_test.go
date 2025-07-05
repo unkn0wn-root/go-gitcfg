@@ -1,4 +1,4 @@
-package gogitcfg
+package gitcfg
 
 import (
 	"os"
