@@ -56,7 +56,17 @@ func (p *parser) parseFromGitCommand(ctx context.Context, opts *configOptions) (
 
 	output, err := cmd.Output()
 	if err != nil {
-		return nil, p.handleGitCommandError(err)
+		var exitError *exec.ExitError
+		if errors.As(err, &exitError) {
+			return nil, &ConfigError{
+				Op:  "load",
+				Err: fmt.Errorf("git config failed: %s", string(exitError.Stderr)),
+			}
+		}
+		return nil, &ConfigError{
+			Op:  "load",
+			Err: fmt.Errorf("failed to execute git config: %w", err),
+		}
 	}
 
 	return p.parseGitConfigOutput(string(output), config)
@@ -68,8 +78,7 @@ func (p *parser) parseFromFiles(ctx context.Context, opts *configOptions) (*Conf
 		sources:  make([]ConfigSource, 0),
 	}
 
-	sourcesToLoad := p.buildSourceList(opts)
-	for _, source := range sourcesToLoad {
+	for _, source := range getAllConfigPaths(opts) {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
@@ -101,24 +110,6 @@ func (p *parser) buildSourceFlags(opts *configOptions) []string {
 	return sourceFlags
 }
 
-func (p *parser) buildSourceList(opts *configOptions) []ConfigSource {
-	return getAllConfigPaths(opts)
-}
-
-func (p *parser) handleGitCommandError(err error) error {
-	var exitError *exec.ExitError
-	if errors.As(err, &exitError) {
-		return &ConfigError{
-			Op:  "load",
-			Err: fmt.Errorf("git config failed: %s", string(exitError.Stderr)),
-		}
-	}
-	return &ConfigError{
-		Op:  "load",
-		Err: fmt.Errorf("failed to execute git config: %w", err),
-	}
-}
-
 func (p *parser) parseGitConfigOutput(output string, config *Config) (*Config, error) {
 	lines := strings.Split(strings.TrimRight(output, "\x00"), "\x00")
 	for _, line := range lines {
@@ -148,23 +139,21 @@ func (p *parser) parseGitConfigLine(line string) (key, value, source string) {
 		parts := strings.SplitN(line, "\t", 2)
 		if len(parts) == 2 {
 			source = strings.TrimPrefix(parts[0], "file:")
-			kvPair := parts[1]
-
-			kvParts := strings.SplitN(kvPair, "=", 2)
+			kvParts := strings.SplitN(parts[1], "=", 2)
 			if len(kvParts) == 2 {
 				key = strings.TrimSpace(kvParts[0])
 				value = kvParts[1]
 			}
 		}
-	} else {
-		// Fallback for older git versions
-		parts := strings.SplitN(line, "=", 2)
-		if len(parts) == 2 {
-			key = strings.TrimSpace(parts[0])
-			value = parts[1]
-		}
+		return key, value, source
 	}
 
+	// Fallback for older git versions
+	parts := strings.SplitN(line, "=", 2)
+	if len(parts) == 2 {
+		key = strings.TrimSpace(parts[0])
+		value = parts[1]
+	}
 	return key, value, source
 }
 
@@ -256,9 +245,7 @@ func (p *parser) buildFullKey(section, key string) string {
 		if len(parts) == 2 {
 			subsection := strings.TrimSpace(parts[1])
 			if len(subsection) >= 2 && subsection[0] == '"' && subsection[len(subsection)-1] == '"' {
-				// Remove quotes from subsection
-				subsection = subsection[1 : len(subsection)-1]
-				return parts[0] + "." + subsection + "." + key
+				return parts[0] + "." + subsection[1:len(subsection)-1] + "." + key
 			}
 		}
 	}
@@ -267,25 +254,15 @@ func (p *parser) buildFullKey(section, key string) string {
 }
 
 func isValidConfigKey(key string) bool {
-	if key == "" {
+	if key == "" || !strings.Contains(key, ".") {
 		return false
 	}
-
-	if !strings.Contains(key, ".") {
-		return false
-	}
-
 	for _, r := range key {
-		if !isValidConfigKeyChar(r) {
+		if !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '.' && r != '-' && r != '_' {
 			return false
 		}
 	}
-
 	return true
-}
-
-func isValidConfigKeyChar(r rune) bool {
-	return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '.' || r == '-' || r == '_'
 }
 
 func isValidSectionName(name string) bool {
@@ -295,46 +272,26 @@ func isValidSectionName(name string) bool {
 
 	// Handle subsections like remote "origin"
 	if strings.Contains(name, " ") {
-		return validateSubsection(name)
+		parts := strings.SplitN(name, " ", 2)
+		if len(parts) != 2 || !isValidKeyName(parts[0]) {
+			return false
+		}
+		subsection := strings.TrimSpace(parts[1])
+		return len(subsection) >= 2 && subsection[0] == '"' && subsection[len(subsection)-1] == '"'
 	}
 
 	return isValidKeyName(name)
 }
 
-func validateSubsection(name string) bool {
-	parts := strings.SplitN(name, " ", 2)
-	if len(parts) != 2 {
-		return false
-	}
-
-	if !isValidKeyName(parts[0]) {
-		return false
-	}
-
-	subsection := strings.TrimSpace(parts[1])
-	if len(subsection) < 2 || subsection[0] != '"' || subsection[len(subsection)-1] != '"' {
-		return false
-	}
-
-	return true
-}
-
 func isValidSubsectionName(name string) bool {
-	if name == "" {
+	if name == "" || !strings.Contains(name, ".") {
 		return false
 	}
-
-	if !strings.Contains(name, ".") {
-		return false
-	}
-
-	parts := strings.Split(name, ".")
-	for _, part := range parts {
+	for _, part := range strings.Split(name, ".") {
 		if !isValidKeyName(part) {
 			return false
 		}
 	}
-
 	return true
 }
 
