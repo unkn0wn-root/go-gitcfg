@@ -1,4 +1,4 @@
-package gogitcfg
+package gitcfg
 
 import (
 	"errors"
@@ -7,6 +7,23 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+)
+
+const (
+	// default system configuration file path.
+	SystemConfigFile = "/etc/gitconfig"
+
+	// default global configuration file name.
+	GlobalConfigFile = ".gitconfig"
+
+	// default local configuration file path.
+	LocalConfigFile = ".git/config"
+
+	// default worktree configuration file path.
+	WorktreeConfigFile = ".git/config.worktree"
+
+	// XDG configuration directory.
+	XDGConfigDir = ".config/git/config"
 )
 
 func validateRepoPath(path string) error {

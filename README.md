@@ -1,4 +1,4 @@
-# gogitcfg
+# go-gitcfg
 
 A Go library for reading and working with Git configuration files. Supports both global and repository-specific configurations.
 
@@ -11,12 +11,12 @@ package main
 
 import (
     "fmt"
-    "github.com/unkn0wn-root/gogitcfg"
+    "github.com/unkn0wn-root/go-gitcfg"
 )
 
 func main() {
     // Load global Git configuration
-    config, err := gogitcfg.LoadGlobal()
+    config, err := gitcfg.LoadGlobal()
     if err != nil {
         panic(err)
     }
@@ -35,34 +35,34 @@ func main() {
 
 ```go
 // Generic type-safe access
-name, err := gogitcfg.Get[string](config, "user.name")
-editor, err := gogitcfg.Get[string](config, "core.editor")
-autocrlf, err := gogitcfg.Get[bool](config, "core.autocrlf")
-filemode, err := gogitcfg.Get[bool](config, "core.filemode")
-timeout, err := gogitcfg.Get[int](config, "http.timeout")
+name, err := gitcfg.Get[string](config, "user.name")
+editor, err := gitcfg.Get[string](config, "core.editor")
+autocrlf, err := gitcfg.Get[bool](config, "core.autocrlf")
+filemode, err := gitcfg.Get[bool](config, "core.filemode")
+timeout, err := gitcfg.Get[int](config, "http.timeout")
 
 // With default values
-timeout := gogitcfg.GetWithDefault[int](config, "http.timeout", 30)
-editor := gogitcfg.GetWithDefault[string](config, "core.editor", "vim")
+timeout := gitcfg.GetWithDefault[int](config, "http.timeout", 30)
+editor := gitcfg.GetWithDefault[string](config, "core.editor", "vim")
 ```
 
 ### Load Different Configuration Sources
 
 ```go
 // Load only global configuration
-config, err := gogitcfg.LoadGlobal()
+config, err := gitcfg.LoadGlobal()
 
 // Load only local repository configuration
-config, err := gogitcfg.LoadLocal("/path/to/repo")
+config, err := gitcfg.LoadLocal("/path/to/repo")
 
 // Load all configuration sources in precedence order
-config, err := gogitcfg.LoadAll("/path/to/repo")
+config, err := gitcfg.LoadAll("/path/to/repo")
 
 // Load with specific options
-config, err := gogitcfg.Load(
-    gogitcfg.WithGlobal(),
-    gogitcfg.WithLocal(),
-    gogitcfg.WithRepoPath("/path/to/repo"),
+config, err := gitcfg.Load(
+    gitcfg.WithGlobal(),
+    gitcfg.WithLocal(),
+    gitcfg.WithRepoPath("/path/to/repo"),
 )
 ```
 
@@ -116,7 +116,7 @@ import "context"
 ctx := context.WithTimeout(context.Background(), 30*time.Second)
 
 // Load with context
-config, err := gogitcfg.LoadWithContext(ctx, gogitcfg.WithGlobal())
+config, err := gitcfg.LoadWithContext(ctx, gogitcfg.WithGlobal())
 
 // Reload with context
 err = config.ReloadWithContext(ctx)
