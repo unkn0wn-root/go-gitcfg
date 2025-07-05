@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"strings"
 	"sync"
-	"time"
 )
 
 type ConfigSource struct {
@@ -88,33 +87,6 @@ func (c *Config) String() string {
 	return sb.String()
 }
 
-func (c *Config) GetString(key string) (string, error) {
-	return Get[string](c, key)
-}
-
-func (c *Config) GetInt(key string) (int, error) {
-	return Get[int](c, key)
-}
-
-func (c *Config) GetBool(key string) (bool, error) {
-	return Get[bool](c, key)
-}
-
-func (c *Config) GetFloat64(key string) (float64, error) {
-	return Get[float64](c, key)
-}
-
-func (c *Config) GetMultiValue(key string) ([]string, error) {
-	// For now, return single value in slice
-    // @todo david: this should parse multi-value configurations
-	value, err := c.GetString(key)
-	if err != nil {
-		return nil, err
-	}
-
-	return []string{value}, nil
-}
-
 func (c *Config) Has(key string) bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -170,48 +142,6 @@ func (c *Config) HasSection(section string) bool {
 	return exists
 }
 
-func (c *Config) GetSectionSize(section string) int {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	sectionMap, exists := c.sections[section]
-	if !exists {
-		return 0
-	}
-
-	return len(sectionMap)
-}
-
-func (c *Config) GetKeys() []string {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	var keys []string
-	for section, sectionMap := range c.sections {
-		for key := range sectionMap {
-			keys = append(keys, fmt.Sprintf("%s.%s", section, key))
-		}
-	}
-
-	return keys
-}
-
-func (c *Config) GetKeysInSection(section string) []string {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	sectionMap, exists := c.sections[section]
-	if !exists {
-		return nil
-	}
-
-	keys := make([]string, 0, len(sectionMap))
-	for key := range sectionMap {
-		keys = append(keys, key)
-	}
-
-	return keys
-}
 
 func (c *Config) GetAll() map[string]map[string]string {
 	c.mu.RLock()
@@ -247,17 +177,6 @@ func (c *Config) ReloadWithContext(ctx context.Context) error {
 	c.mu.Unlock()
 
 	if len(sources) == 0 {
-		// No sources recorded, reload global config as fallback
-		newConfig, err := LoadGlobalWithContext(ctx)
-		if err != nil {
-			return fmt.Errorf("failed to reload configuration: %w", err)
-		}
-
-		c.mu.Lock()
-		c.sections = newConfig.sections
-		c.sources = newConfig.sources
-		c.mu.Unlock()
-
 		return nil
 	}
 
@@ -310,29 +229,14 @@ func (c *Config) Clone() *Config {
 	return clone
 }
 
-func (c *Config) Size() int {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	count := 0
-	for _, sectionMap := range c.sections {
-		count += len(sectionMap)
-	}
-
-	return count
-}
-
-func (c *Config) IsEmpty() bool {
-	return c.Size() == 0
-}
 
 func (c *Config) GetUser() (*User, error) {
-	name, err := c.GetString("user.name")
+	name, err := Get[string](c, "user.name")
 	if err != nil {
 		return nil, fmt.Errorf("failed to get user.name: %w", err)
 	}
 
-	email, err := c.GetString("user.email")
+	email, err := Get[string](c, "user.email")
 	if err != nil {
 		return nil, fmt.Errorf("failed to get user.email: %w", err)
 	}
@@ -343,149 +247,12 @@ func (c *Config) GetUser() (*User, error) {
 	}, nil
 }
 
-func (c *Config) GetRemote(name string) (*Remote, error) {
-	if name == "" {
-		name = "origin"
-	}
-
-	sectionName := fmt.Sprintf("remote.%s", name)
-	section := c.GetSection(sectionName)
-	if len(section) == 0 {
-		return nil, &ConfigError{
-			Op:      "get",
-			Section: sectionName,
-			Err:     ErrSectionNotFound,
-		}
-	}
-
-	remote := &Remote{
-		Name: name,
-	}
-
-	if url, exists := section["url"]; exists {
-		remote.URL = url
-	}
-	if fetchURL, exists := section["fetchurl"]; exists {
-		remote.FetchURL = fetchURL
-	}
-	if pushURL, exists := section["pushurl"]; exists {
-		remote.PushURL = pushURL
-	}
-
-	// Handle multiple fetch/push specifications
-	// ffor now, handle single values
-    // @todo: should maybe be extended?
-	if fetch, exists := section["fetch"]; exists {
-		remote.Fetch = []string{fetch}
-	}
-	if push, exists := section["push"]; exists {
-		remote.Push = []string{push}
-	}
-
-	return remote, nil
-}
 
 func (c *Config) GetRemoteURL(remote string) (string, error) {
 	if remote == "" {
 		remote = "origin"
 	}
-	return c.GetString(fmt.Sprintf("remote.%s.url", remote))
-}
-
-func (c *Config) GetBranchConfig(name string) (*Branch, error) {
-	sectionName := fmt.Sprintf("branch.%s", name)
-	section := c.GetSection(sectionName)
-	if len(section) == 0 {
-		return nil, &ConfigError{
-			Op:      "get",
-			Section: sectionName,
-			Err:     ErrSectionNotFound,
-		}
-	}
-
-	branch := &Branch{
-		Name: name,
-	}
-
-	if remote, exists := section["remote"]; exists {
-		branch.Remote = remote
-	}
-	if merge, exists := section["merge"]; exists {
-		branch.Merge = merge
-	}
-	if rebase, exists := section["rebase"]; exists {
-		branch.Rebase = rebase
-	}
-
-	return branch, nil
-}
-
-func (c *Config) GetCoreConfig() (*CoreConfig, error) {
-	core := &CoreConfig{}
-
-	if editor, err := c.GetString(CoreEditor); err == nil {
-		core.Editor = editor
-	}
-	if autocrlf, err := c.GetString(CoreAutoCRLF); err == nil {
-		core.AutoCRLF = autocrlf
-	}
-	if safecrlf, err := c.GetString(CoreSafeCRLF); err == nil {
-		core.SafeCRLF = safecrlf
-	}
-	if filemode, err := c.GetBool(CoreFileMode); err == nil {
-		core.FileMode = filemode
-	}
-	if symlinks, err := c.GetBool(CoreSymlinks); err == nil {
-		core.Symlinks = symlinks
-	}
-	if ignorecase, err := c.GetBool(CoreIgnoreCase); err == nil {
-		core.IgnoreCase = ignorecase
-	}
-	if quotepath, err := c.GetBool(CoreQuotePath); err == nil {
-		core.QuotePath = quotepath
-	}
-	if eol, err := c.GetString(CoreEOL); err == nil {
-		core.EOL = eol
-	}
-	if pager, err := c.GetString(CorePager); err == nil {
-		core.Pager = pager
-	}
-	if bare, err := c.GetBool(CoreBare); err == nil {
-		core.Bare = bare
-	}
-	if logallrefupdates, err := c.GetBool(CoreLogAllRefUpdates); err == nil {
-		core.LogAllRefUpdates = logallrefupdates
-	}
-	if repoformat, err := c.GetInt(CoreRepositoryFormatVersion); err == nil {
-		core.RepositoryFormatVersion = repoformat
-	}
-
-	return core, nil
-}
-
-func (c *Config) GetHTTPConfig() (*HTTPConfig, error) {
-	http := &HTTPConfig{}
-
-	if postbuffer, err := c.GetInt(HTTPPostBuffer); err == nil {
-		http.PostBuffer = postbuffer
-	}
-	if proxy, err := c.GetString(HTTPSProxy); err == nil {
-		http.Proxy = proxy
-	}
-	if sslverify, err := c.GetBool(HTTPSLLVerify); err == nil {
-		http.SSLVerify = sslverify
-	}
-	if timeout, err := c.GetInt(HTTPTimeout); err == nil {
-		http.Timeout = time.Duration(timeout) * time.Second
-	}
-	if lowspeedlimit, err := c.GetInt(HTTPLowSpeedLimit); err == nil {
-		http.LowSpeedLimit = lowspeedlimit
-	}
-	if lowspeedtime, err := c.GetInt(HTTPLowSpeedTime); err == nil {
-		http.LowSpeedTime = time.Duration(lowspeedtime) * time.Second
-	}
-
-	return http, nil
+	return Get[string](c, fmt.Sprintf("remote.%s.url", remote))
 }
 
 func (c *Config) setRawValue(key, value string) error {

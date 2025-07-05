@@ -34,23 +34,16 @@ func main() {
 ### Type-Safe Value Access
 
 ```go
-// String values
-name, err := config.GetString("user.name")
-editor, err := config.GetString("core.editor")
-
-// Boolean values
-autocrlf, err := config.GetBool("core.autocrlf")
-filemode, err := config.GetBool("core.filemode")
-
-// Integer values
-timeout, err := config.GetInt("http.timeout")
-
 // Generic type-safe access
+name, err := gogitcfg.Get[string](config, "user.name")
 editor, err := gogitcfg.Get[string](config, "core.editor")
+autocrlf, err := gogitcfg.Get[bool](config, "core.autocrlf")
+filemode, err := gogitcfg.Get[bool](config, "core.filemode")
 timeout, err := gogitcfg.Get[int](config, "http.timeout")
 
 // With default values
 timeout := gogitcfg.GetWithDefault[int](config, "http.timeout", 30)
+editor := gogitcfg.GetWithDefault[string](config, "core.editor", "vim")
 ```
 
 ### Load Different Configuration Sources
@@ -80,17 +73,15 @@ config, err := gogitcfg.Load(
 user, err := config.GetUser()
 fmt.Printf("Name: %s, Email: %s\n", user.Name, user.Email)
 
-// Remote configuration
-remote, err := config.GetRemote("origin")
-fmt.Printf("URL: %s\n", remote.URL)
+// Remote URL (simplified access)
+remoteURL, err := config.GetRemoteURL("origin")
+fmt.Printf("URL: %s\n", remoteURL)
 
-// Branch configuration
-branch, err := config.GetBranchConfig("main")
-fmt.Printf("Remote: %s, Merge: %s\n", branch.Remote, branch.Merge)
-
-// Core configuration
-core, err := config.GetCoreConfig()
-fmt.Printf("Editor: %s, AutoCRLF: %s\n", core.Editor, core.AutoCRLF)
+// Direct section access for complex configurations
+remoteSection := config.GetSection("remote.origin")
+for key, value := range remoteSection {
+    fmt.Printf("%s = %s\n", key, value)
+}
 ```
 
 ### Working with Sections and Keys
@@ -105,14 +96,15 @@ if config.Has("user.name") {
 sections := config.GetSections()
 fmt.Printf("Found sections: %v\n", sections)
 
-// Get all keys in a section
-userKeys := config.GetKeysInSection("user")
-fmt.Printf("User section keys: %v\n", userKeys)
-
 // Get entire section as map
 userSection := config.GetSection("user")
 for key, value := range userSection {
     fmt.Printf("%s = %s\n", key, value)
+}
+
+// Check if section exists
+if config.HasSection("user") {
+    fmt.Println("User section exists")
 }
 ```
 
