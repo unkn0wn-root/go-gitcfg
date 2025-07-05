@@ -10,20 +10,11 @@ import (
 )
 
 const (
-	// default system configuration file path.
-	SystemConfigFile = "/etc/gitconfig"
-
-	// default global configuration file name.
-	GlobalConfigFile = ".gitconfig"
-
-	// default local configuration file path.
-	LocalConfigFile = ".git/config"
-
-	// default worktree configuration file path.
-	WorktreeConfigFile = ".git/config.worktree"
-
-	// XDG configuration directory.
-	XDGConfigDir = ".config/git/config"
+	SystemConfigFile = "/etc/gitconfig"         // default system configuration file path.
+	GlobalConfigFile = ".gitconfig"             // default global configuration file name.
+	LocalConfigFile = ".git/config"             // default local configuration file path.
+	WorktreeConfigFile = ".git/config.worktree" // default worktree configuration file path.
+	XDGConfigDir = ".config/git/config"         // XDG configuration directory.
 )
 
 func validateRepoPath(path string) error {
