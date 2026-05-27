@@ -7,193 +7,115 @@ import (
 )
 
 func TestValidateRepoPath(t *testing.T) {
-	err := validateRepoPath("")
-	if err == nil {
-		t.Error("Expected error for empty path")
+	if _, err := findGitDir(""); err == nil {
+		t.Fatal("expected empty path to fail")
+	}
+	if _, err := findGitDir(filepath.Join(t.TempDir(), "missing")); err == nil {
+		t.Fatal("expected missing path to fail")
 	}
 
-	err = validateRepoPath("/nonexistent/path")
-	if err == nil {
-		t.Error("Expected error for non-existent path")
+	dir := t.TempDir()
+	if _, err := findGitDir(dir); err == nil {
+		t.Fatal("expected non-repository to fail")
 	}
 
-	tempDir, err := os.MkdirTemp("", "test-repo")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tempDir)
-
-	err = validateRepoPath(tempDir)
-	if err == nil {
-		t.Error("Expected error for non-git directory")
-	}
-
-	gitDir := filepath.Join(tempDir, ".git")
-	err = os.Mkdir(gitDir, 0755)
-	if err != nil {
-		t.Fatalf("Failed to create .git dir: %v", err)
-	}
-
-	err = validateRepoPath(tempDir)
-	if err != nil {
-		t.Errorf("Unexpected error for valid git repo: %v", err)
+	writeFile(t, dir, ".git/HEAD", "ref: refs/heads/main\n")
+	if _, err := findGitDir(dir); err != nil {
+		t.Fatalf("expected .git directory repository to pass: %v", err)
 	}
 }
 
-func TestGetSystemConfigPath(t *testing.T) {
-	path := getSystemConfigPath()
-	t.Logf("System config path: %s", path)
-}
-
-func TestGetGlobalConfigPath(t *testing.T) {
-	path := getGlobalConfigPath()
-	t.Logf("Global config path: %s", path)
-}
-
-func TestGetLocalConfigPath(t *testing.T) {
-	path := getLocalConfigPath("")
-	if path != "" {
-		t.Errorf("Expected empty path, got '%s'", path)
+func TestValidateRepoPathSupportsGitFile(t *testing.T) {
+	dir := t.TempDir()
+	repo := filepath.Join(dir, "repo")
+	gitDir := filepath.Join(dir, "actual.git")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatalf("mkdir repo: %v", err)
 	}
-
-	path = getLocalConfigPath("/nonexistent/path")
-	if path != "" {
-		t.Errorf("Expected empty path, got '%s'", path)
+	if err := os.MkdirAll(gitDir, 0o755); err != nil {
+		t.Fatalf("mkdir git dir: %v", err)
 	}
+	writeFile(t, repo, ".git", "gitdir: ../actual.git\n")
 
-	tempDir, err := os.MkdirTemp("", "test-repo")
+	got, err := findGitDir(repo)
 	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
+		t.Fatalf("findGitDir failed: %v", err)
 	}
-	defer os.RemoveAll(tempDir)
-
-	gitDir := filepath.Join(tempDir, ".git")
-	err = os.Mkdir(gitDir, 0755)
-	if err != nil {
-		t.Fatalf("Failed to create .git dir: %v", err)
-	}
-
-	configPath := filepath.Join(gitDir, "config")
-	err = os.WriteFile(configPath, []byte("[test]\n"), 0644)
-	if err != nil {
-		t.Fatalf("Failed to create config file: %v", err)
-	}
-
-	path = getLocalConfigPath(tempDir)
-	if path != configPath {
-		t.Errorf("Expected '%s', got '%s'", configPath, path)
+	if got != gitDir {
+		t.Fatalf("findGitDir = %q, want %q", got, gitDir)
 	}
 }
 
-func TestGetWorktreeConfigPath(t *testing.T) {
-	path := getWorktreeConfigPath("")
-	if path != "" {
-		t.Errorf("Expected empty path, got '%s'", path)
-	}
+func TestGlobalConfigPathsIncludeXDGAndHome(t *testing.T) {
+	home := t.TempDir()
+	xdg := filepath.Join(home, "xdg")
+	xdgPath := writeFile(t, xdg, "git/config", "[core]\n")
+	homePath := writeFile(t, home, ".gitconfig", "[user]\n")
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", xdg)
+	t.Setenv("GIT_CONFIG_GLOBAL", "")
 
-	path = getWorktreeConfigPath("/nonexistent/path")
-	if path != "" {
-		t.Errorf("Expected empty path, got '%s'", path)
-	}
-
-	tempDir, err := os.MkdirTemp("", "test-repo")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tempDir)
-
-	gitDir := filepath.Join(tempDir, ".git")
-	err = os.Mkdir(gitDir, 0755)
-	if err != nil {
-		t.Fatalf("Failed to create .git dir: %v", err)
-	}
-
-	configPath := filepath.Join(gitDir, "config.worktree")
-	err = os.WriteFile(configPath, []byte("[test]\n"), 0644)
-	if err != nil {
-		t.Fatalf("Failed to create config file: %v", err)
-	}
-
-	path = getWorktreeConfigPath(tempDir)
-	if path != configPath {
-		t.Errorf("Expected '%s', got '%s'", configPath, path)
+	paths := getGlobalConfigPaths()
+	if len(paths) != 2 || paths[0] != xdgPath || paths[1] != homePath {
+		t.Fatalf("unexpected global paths: %#v", paths)
 	}
 }
 
-func TestGetAllConfigPaths(t *testing.T) {
-	opts := &configOptions{
-		includeGlobal: true,
-	}
+func TestGlobalConfigEnvOverride(t *testing.T) {
+	dir := t.TempDir()
+	override := writeFile(t, dir, "override.gitconfig", "[user]\n")
+	t.Setenv("GIT_CONFIG_GLOBAL", override)
 
-	sources := getAllConfigPaths(opts)
-	t.Logf("Found %d config sources", len(sources))
-
-	for _, source := range sources {
-		t.Logf("Source: %s - %s", source.Type, source.Path)
+	paths := getGlobalConfigPaths()
+	if len(paths) != 1 || paths[0] != override {
+		t.Fatalf("unexpected override paths: %#v", paths)
 	}
 }
 
-func TestGetXDGConfigPath(t *testing.T) {
-	originalXDG := os.Getenv("XDG_CONFIG_HOME")
-	defer func() {
-		if originalXDG != "" {
-			os.Setenv("XDG_CONFIG_HOME", originalXDG)
-		} else {
-			os.Unsetenv("XDG_CONFIG_HOME")
-		}
-	}()
+func TestConfigSourcesRespectExplicitScopes(t *testing.T) {
+	dir := t.TempDir()
+	global := writeFile(t, dir, "global.gitconfig", "[user]\n")
+	repo := filepath.Join(dir, "repo")
+	local := writeFile(t, repo, ".git/config", "[core]\n")
+	t.Setenv("GIT_CONFIG_GLOBAL", global)
 
-	tempDir, err := os.MkdirTemp("", "test-xdg")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
+	sources := getConfigSources(options{
+		scopes:   []Scope{ScopeLocal},
+		repoPath: repo,
+	})
+	if len(sources) != 1 {
+		t.Fatalf("expected only local source, got %#v", sources)
 	}
-	defer os.RemoveAll(tempDir)
-
-	xdgDir := filepath.Join(tempDir, "git")
-	err = os.MkdirAll(xdgDir, 0755)
-	if err != nil {
-		t.Fatalf("Failed to create XDG git dir: %v", err)
-	}
-
-	configPath := filepath.Join(xdgDir, "config")
-	err = os.WriteFile(configPath, []byte("[test]\n"), 0644)
-	if err != nil {
-		t.Fatalf("Failed to create config file: %v", err)
-	}
-
-	os.Setenv("XDG_CONFIG_HOME", tempDir)
-
-	path := getXDGConfigPath()
-	if path != configPath {
-		t.Errorf("Expected '%s', got '%s'", configPath, path)
+	if sources[0].Scope != ScopeLocal || sources[0].Path != local {
+		t.Fatalf("unexpected source: %#v", sources[0])
 	}
 }
 
-func TestGetHomeConfigPath(t *testing.T) {
-	path := getHomeConfigPath()
-	t.Logf("Home config path: %s", path)
-}
+func TestSystemConfigEnv(t *testing.T) {
+	dir := t.TempDir()
+	system := writeFile(t, dir, "system.gitconfig", "[core]\n")
+	t.Setenv("GIT_CONFIG_SYSTEM", system)
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "")
 
-func TestParseSystemConfigPath(t *testing.T) {
-	tests := []struct {
-		output   string
-		expected string
-	}{
-		{"file:/etc/gitconfig\tcore.editor=vim", "/etc/gitconfig"},
-		{"file:/usr/local/etc/gitconfig\tuser.name=test", "/usr/local/etc/gitconfig"},
-		{"no file prefix", ""},
-		{"", ""},
+	paths := getSystemConfigPaths()
+	if len(paths) != 1 || paths[0] != system {
+		t.Fatalf("unexpected system paths: %#v", paths)
 	}
 
-	for _, test := range tests {
-		result := parseSystemConfigPath(test.output)
-		if result != test.expected {
-			t.Errorf("Expected '%s', got '%s'", test.expected, result)
-		}
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	if paths := getSystemConfigPaths(); len(paths) != 0 {
+		t.Fatalf("expected no system paths, got %#v", paths)
 	}
 }
 
-func TestGetSystemConfigPathFallback(t *testing.T) {
-	path := getSystemConfigPathFallback()
-	t.Logf("System config fallback path: %s", path)
+func writeFile(t *testing.T, dir, rel, content string) string {
+	t.Helper()
+	path := filepath.Join(dir, rel)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", filepath.Dir(path), err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+	return path
 }

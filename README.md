@@ -1,132 +1,106 @@
 # go-gitcfg
 
-A Go library for reading and working with Git configuration files. Supports both global and repository-specific configurations.
+`go-gitcfg` is a small Go library for reading Git configuration files.
+
+It uses a pure Go parser by default, preserves repeated keys, follows Git configuration precedence and supports `include.path` plus common `includeIf` conditions.
+
+## Install
+
+```sh
+go get github.com/unkn0wn-root/gitcfg
+```
 
 ## Quick Start
-
-### Load Global Configuration
 
 ```go
 package main
 
 import (
-    "fmt"
-    "github.com/unkn0wn-root/go-gitcfg"
+	"context"
+	"fmt"
+
+	"github.com/unkn0wn-root/gitcfg"
 )
 
 func main() {
-    // Load global Git configuration
-    config, err := gitcfg.LoadGlobal()
-    if err != nil {
-        panic(err)
-    }
+	cfg, err := gitcfg.LoadGlobal(context.Background())
+	if err != nil {
+		panic(err)
+	}
 
-    // Get user information
-    user, err := config.GetUser()
-    if err != nil {
-        panic(err)
-    }
+	user, err := cfg.User()
+	if err != nil {
+		panic(err)
+	}
 
-    fmt.Printf("User: %s <%s>\n", user.Name, user.Email)
+	fmt.Printf("%s <%s>\n", user.Name, user.Email)
 }
 ```
 
-### Type-Safe Value Access
+## Loading
 
 ```go
-// Generic type-safe access
-name, err := gitcfg.Get[string](config, "user.name")
-editor, err := gitcfg.Get[string](config, "core.editor")
-autocrlf, err := gitcfg.Get[bool](config, "core.autocrlf")
-filemode, err := gitcfg.Get[bool](config, "core.filemode")
-timeout, err := gitcfg.Get[int](config, "http.timeout")
+ctx := context.Background()
 
-// With default values
-timeout := gitcfg.GetWithDefault[int](config, "http.timeout", 30)
-editor := gitcfg.GetWithDefault[string](config, "core.editor", "vim")
-```
+// Global configuration only. This is also the default for Load.
+cfg, err := gitcfg.LoadGlobal(ctx)
 
-### Load Different Configuration Sources
+// Local repository configuration only.
+cfg, err = gitcfg.LoadLocal(ctx, "/path/to/repo")
 
-```go
-// Load only global configuration
-config, err := gitcfg.LoadGlobal()
+// System, global, local, and worktree scopes in Git precedence order.
+cfg, err = gitcfg.LoadAll(ctx, "/path/to/repo")
 
-// Load only local repository configuration
-config, err := gitcfg.LoadLocal("/path/to/repo")
-
-// Load all configuration sources in precedence order
-config, err := gitcfg.LoadAll("/path/to/repo")
-
-// Load with specific options
-config, err := gitcfg.Load(
-    gitcfg.WithGlobal(),
-    gitcfg.WithLocal(),
-    gitcfg.WithRepoPath("/path/to/repo"),
+// Explicit scopes and options.
+cfg, err = gitcfg.Load(
+	ctx,
+	gitcfg.WithScopes(gitcfg.ScopeGlobal, gitcfg.ScopeLocal),
+	gitcfg.WithRepoPath("/path/to/repo"),
+	gitcfg.WithIncludes(true),
 )
+
+// Optional: use `git config` instead of the pure-Go parser.
+cfg, err = gitcfg.Load(ctx, gitcfg.WithGitCommand())
 ```
 
-### Structured Config Access
+## Accessing Values
 
 ```go
-// User configuration
-user, err := config.GetUser()
-fmt.Printf("Name: %s, Email: %s\n", user.Name, user.Email)
+name, err := gitcfg.Get[string](cfg, "user.name")
+autocrlf, err := gitcfg.Get[bool](cfg, "core.autocrlf")
+timeout := gitcfg.GetDefault[int](cfg, "http.timeout", 30)
 
-// Remote URL (simplified access)
-remoteURL, err := config.GetRemoteURL("origin")
-fmt.Printf("URL: %s\n", remoteURL)
+editor, err := cfg.Value("core.editor")
+editors := cfg.Values("core.editor") // all repeated values, in parse order
+entries := cfg.Entries("remote.origin.fetch")
 
-// Direct section access for complex configurations
-remoteSection := config.GetSection("remote.origin")
-for key, value := range remoteSection {
-    fmt.Printf("%s = %s\n", key, value)
-}
+remoteURL, err := cfg.RemoteURL("origin")
+user, err := cfg.User()
 ```
 
-### Working with Sections and Keys
+Simple getters return the last value. Use `Values` or `Entries` when you need every occurrence of a repeated key.
+
+## Sections And Sources
 
 ```go
-// Check if key exists
-if config.Has("user.name") {
-    fmt.Println("User name is configured")
+if cfg.Has("user.email") {
+	fmt.Println("email configured")
 }
 
-// Get all sections
-sections := config.GetSections()
-fmt.Printf("Found sections: %v\n", sections)
-
-// Get entire section as map
-userSection := config.GetSection("user")
-for key, value := range userSection {
-    fmt.Printf("%s = %s\n", key, value)
+for _, section := range cfg.Sections() {
+	fmt.Println(section)
 }
 
-// Check if section exists
-if config.HasSection("user") {
-    fmt.Println("User section exists")
-}
+remote := cfg.Section("remote.origin")
+all := cfg.All()
+sources := cfg.Sources()
 ```
 
-### With context
+## Supported Scopes
 
-```go
-import "context"
+- `ScopeSystem`: `/etc/gitconfig` and common system fallback paths
+- `ScopeGlobal`: XDG global config and `~/.gitconfig`
+- `ScopeLocal`: `.git/config`
+- `ScopeWorktree`: `.git/config.worktree`
 
-ctx := context.WithTimeout(context.Background(), 30*time.Second)
-
-// Load with context
-config, err := gitcfg.LoadWithContext(ctx, gogitcfg.WithGlobal())
-
-// Reload with context
-err = config.ReloadWithContext(ctx)
-```
-
-## Configuration Sources
-
-The library supports all standard Git configuration sources:
-
-- **System**: `/etc/gitconfig` (system-wide)
-- **Global**: `~/.gitconfig` (user-specific)
-- **Local**: `.git/config` (repository-specific)
-- **Worktree**: `.git/config.worktree` (worktree-specific)
+Environment overrides such as `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM` and `GIT_CONFIG_NOSYSTEM` are respected.

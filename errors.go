@@ -7,12 +7,19 @@ import (
 )
 
 var (
-	ErrKeyNotFound      = errors.New("key not found")
-	ErrSectionNotFound  = errors.New("section not found")
+	// ErrKeyNotFound means the requested key is not present.
+	ErrKeyNotFound = errors.New("key not found")
+	// ErrSectionNotFound means the requested section is not present.
+	ErrSectionNotFound = errors.New("section not found")
+	// ErrInvalidKeyFormat means a key cannot be parsed as Git config syntax.
 	ErrInvalidKeyFormat = errors.New("invalid key format")
-	ErrInvalidValue     = errors.New("invalid value")
+	// ErrInvalidValue means a value cannot be converted or parsed.
+	ErrInvalidValue = errors.New("invalid value")
+	// ErrIncludeCycle means config includes recursively reference each other.
+	ErrIncludeCycle = errors.New("include cycle")
 )
 
+// ConfigError adds operation, key, section and source context to errors.
 type ConfigError struct {
 	Op      string
 	Key     string
@@ -22,7 +29,10 @@ type ConfigError struct {
 }
 
 func (e *ConfigError) Error() string {
-	parts := []string{"gitconfig:", e.Op}
+	parts := []string{"gitcfg:"}
+	if e.Op != "" {
+		parts = append(parts, e.Op)
+	}
 
 	if e.Section != "" && e.Key != "" {
 		parts = append(parts, fmt.Sprintf("%s.%s", e.Section, e.Key))
@@ -34,19 +44,12 @@ func (e *ConfigError) Error() string {
 		parts = append(parts, fmt.Sprintf("(source: %s)", e.Source))
 	}
 
-	parts = append(parts, e.Err.Error())
+	if e.Err != nil {
+		parts = append(parts, e.Err.Error())
+	}
 	return strings.Join(parts, " ")
 }
 
 func (e *ConfigError) Unwrap() error {
 	return e.Err
 }
-
-func (e *ConfigError) Is(target error) bool {
-	var targetErr *ConfigError
-	if !errors.As(target, &targetErr) {
-		return false
-	}
-	return e.Op == targetErr.Op && e.Key == targetErr.Key && e.Section == targetErr.Section
-}
-

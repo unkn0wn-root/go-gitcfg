@@ -2,198 +2,307 @@ package gitcfg
 
 import (
 	"context"
+	"errors"
+	"os"
+	"strings"
+	"sync"
 	"testing"
-	"time"
 )
 
-func TestLoad(t *testing.T) {
-	config, err := Load(WithGlobal())
-	if err != nil {
-		t.Fatalf("Load failed: %v", err)
-	}
-	if config == nil {
-		t.Fatal("Config is nil")
-	}
-}
+type customInt int
 
-func TestLoadWithContext(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+func TestConfigAccessors(t *testing.T) {
+	config := newConfig()
+	source := Source{Scope: ScopeGlobal, Path: "/tmp/gitconfig"}
 
-	config, err := LoadWithContext(ctx, WithGlobal())
-	if err != nil {
-		t.Fatalf("LoadWithContext failed: %v", err)
-	}
-	if config == nil {
-		t.Fatal("Config is nil")
-	}
-}
+	mustAddEntry(t, config, "user.name", "Test User", source)
+	mustAddEntry(t, config, "user.email", "test@example.com", source)
+	mustAddEntry(t, config, "core.editor", "vim", source)
+	mustAddEntry(t, config, "core.editor", "nvim", source)
+	mustAddEntry(t, config, "remote.origin.url", "git@example.com:repo.git", source)
 
-func TestLoadGlobal(t *testing.T) {
-	config, err := LoadGlobal()
-	if err != nil {
-		t.Fatalf("LoadGlobal failed: %v", err)
-	}
-	if config == nil {
-		t.Fatal("Config is nil")
-	}
-}
-
-func TestConfigGet(t *testing.T) {
-	config := &Config{
-		sections: map[string]map[string]string{
-			"test": {"key": "value"},
-		},
-	}
-
-	value, err := Get[string](config, "test.key")
+	editor, err := Get[string](config, "core.editor")
 	if err != nil {
 		t.Fatalf("Get failed: %v", err)
 	}
-	if value != "value" {
-		t.Errorf("Expected 'value', got '%s'", value)
+	if editor != "nvim" {
+		t.Fatalf("expected last editor value, got %q", editor)
+	}
+
+	values := config.Values("core.editor")
+	if len(values) != 2 || values[0] != "vim" || values[1] != "nvim" {
+		t.Fatalf("unexpected repeated values: %#v", values)
+	}
+
+	if got := GetDefault[string](config, "core.missing", "fallback"); got != "fallback" {
+		t.Fatalf("expected fallback, got %q", got)
+	}
+
+	mustAddEntry(t, config, "http.timeout", "42", source)
+	timeout, err := Get[customInt](config, "http.timeout")
+	if err != nil {
+		t.Fatalf("Get named scalar failed: %v", err)
+	}
+	if timeout != 42 {
+		t.Fatalf("unexpected named scalar value: %v", timeout)
+	}
+
+	if !config.Has("user.email") {
+		t.Fatal("expected user.email to exist")
+	}
+	if config.Has("user.missing") {
+		t.Fatal("did not expect user.missing to exist")
+	}
+
+	user, err := config.User()
+	if err != nil {
+		t.Fatalf("User failed: %v", err)
+	}
+	if user.Name != "Test User" || user.Email != "test@example.com" {
+		t.Fatalf("unexpected user: %#v", user)
+	}
+
+	remote, err := config.RemoteURL("")
+	if err != nil {
+		t.Fatalf("RemoteURL failed: %v", err)
+	}
+	if remote != "git@example.com:repo.git" {
+		t.Fatalf("unexpected remote URL: %q", remote)
 	}
 }
 
-func TestConfigGetWithDefault(t *testing.T) {
-	config := &Config{
-		sections: map[string]map[string]string{},
+func TestConfigSectionsSourcesCloneAndString(t *testing.T) {
+	config := newConfig()
+	source := Source{Scope: ScopeGlobal, Path: "/tmp/gitconfig"}
+	config.addSource(source)
+	mustAddEntry(t, config, "user.name", "Test User", source)
+	mustAddEntry(t, config, "core.editor", "nvim", source)
+
+	sections := config.Sections()
+	if len(sections) != 2 || sections[0] != "core" || sections[1] != "user" {
+		t.Fatalf("unexpected sections: %#v", sections)
 	}
 
-	value := GetWithDefault[string](config, "nonexistent.key", "default")
-	if value != "default" {
-		t.Errorf("Expected 'default', got '%s'", value)
+	user := config.Section("USER")
+	if user["name"] != "Test User" {
+		t.Fatalf("unexpected user section: %#v", user)
 	}
-}
-
-func TestConfigHas(t *testing.T) {
-	config := &Config{
-		sections: map[string]map[string]string{
-			"test": {"key": "value"},
-		},
-	}
-
-	if !config.Has("test.key") {
-		t.Error("Expected key to exist")
-	}
-	if config.Has("nonexistent.key") {
-		t.Error("Expected key to not exist")
-	}
-}
-
-func TestConfigGetSection(t *testing.T) {
-	config := &Config{
-		sections: map[string]map[string]string{
-			"test": {"key1": "value1", "key2": "value2"},
-		},
-	}
-
-	section := config.GetSection("test")
-	if len(section) != 2 {
-		t.Errorf("Expected 2 keys, got %d", len(section))
-	}
-	if section["key1"] != "value1" {
-		t.Errorf("Expected 'value1', got '%s'", section["key1"])
-	}
-}
-
-func TestConfigGetSections(t *testing.T) {
-	config := &Config{
-		sections: map[string]map[string]string{
-			"test1": {"key": "value"},
-			"test2": {"key": "value"},
-		},
-	}
-
-	sections := config.GetSections()
-	if len(sections) != 2 {
-		t.Errorf("Expected 2 sections, got %d", len(sections))
-	}
-}
-
-func TestConfigString(t *testing.T) {
-	config := &Config{
-		sections: map[string]map[string]string{
-			"test": {"key": "value"},
-		},
-	}
-
-	str := config.String()
-	if str == "" {
-		t.Error("Expected non-empty string representation")
-	}
-}
-
-func TestConfigClone(t *testing.T) {
-	config := &Config{
-		sections: map[string]map[string]string{
-			"test": {"key": "value"},
-		},
+	user["name"] = "mutated"
+	if config.Section("user")["name"] != "Test User" {
+		t.Fatal("Section returned mutable internal state")
 	}
 
 	clone := config.Clone()
-	if clone == nil {
-		t.Fatal("Clone is nil")
-	}
-
-	// Modify original
-	config.sections["test"]["key"] = "modified"
-
-	// Clone should be unchanged
-	if clone.sections["test"]["key"] != "value" {
-		t.Error("Clone was modified when original changed")
-	}
-}
-
-
-func TestConfigGetUser(t *testing.T) {
-	config := &Config{
-		sections: map[string]map[string]string{
-			"user": {"name": "Test User", "email": "test@example.com"},
-		},
-	}
-
-	user, err := config.GetUser()
+	mustAddEntry(t, config, "user.name", "Changed", source)
+	value, err := clone.Value("user.name")
 	if err != nil {
-		t.Fatalf("GetUser failed: %v", err)
+		t.Fatalf("clone Value failed: %v", err)
 	}
-	if user.Name != "Test User" {
-		t.Errorf("Expected 'Test User', got '%s'", user.Name)
+	if value != "Test User" {
+		t.Fatalf("clone changed with original: %q", value)
 	}
-	if user.Email != "test@example.com" {
-		t.Errorf("Expected 'test@example.com', got '%s'", user.Email)
+
+	rendered := config.String()
+	if !strings.Contains(rendered, "# global: /tmp/gitconfig") ||
+		!strings.Contains(rendered, "[core]\n  editor = nvim") ||
+		!strings.Contains(rendered, "[user]\n  name = Changed") {
+		t.Fatalf("unexpected String output:\n%s", rendered)
 	}
 }
 
-func TestConfigError(t *testing.T) {
-	err := &ConfigError{
-		Op:      "test",
-		Key:     "test.key",
-		Section: "test",
-		Source:  "test.config",
-		Err:     ErrKeyNotFound,
+func TestTypedGetErrors(t *testing.T) {
+	config := newConfig()
+	source := Source{Scope: ScopeGlobal, Path: "/tmp/gitconfig"}
+	mustAddEntry(t, config, "core.autocrlf", "maybe", source)
+
+	_, err := Get[bool](config, "core.autocrlf")
+	if !errors.Is(err, ErrInvalidValue) {
+		t.Fatalf("expected ErrInvalidValue, got %v", err)
 	}
 
-	errStr := err.Error()
-	if errStr == "" {
-		t.Error("Expected non-empty error string")
+	_, err = Get[string](config, "invalid")
+	if !errors.Is(err, ErrInvalidKeyFormat) {
+		t.Fatalf("expected ErrInvalidKeyFormat, got %v", err)
+	}
+
+	_, err = Get[string](config, "core.missing")
+	if !errors.Is(err, ErrKeyNotFound) {
+		t.Fatalf("expected ErrKeyNotFound, got %v", err)
+	}
+
+	_, err = Get[string](config, "user.name")
+	if !errors.Is(err, ErrSectionNotFound) {
+		t.Fatalf("expected ErrSectionNotFound, got %v", err)
 	}
 }
 
-func TestConfigSourceType(t *testing.T) {
-	tests := []struct {
-		sourceType ConfigSourceType
-		expected   string
-	}{
-		{SourceTypeSystem, "system"},
-		{SourceTypeGlobal, "global"},
-		{SourceTypeLocal, "local"},
-		{SourceTypeWorktree, "worktree"},
+func TestConfigErrorPrefix(t *testing.T) {
+	err := &ConfigError{Op: "get", Key: "user.name", Err: ErrKeyNotFound}
+	if got := err.Error(); !strings.HasPrefix(got, "gitcfg:") {
+		t.Fatalf("unexpected error prefix: %q", got)
+	}
+}
+
+func TestLoadGlobalUsesFixtureEnvironment(t *testing.T) {
+	home := t.TempDir()
+	global := writeFile(t, home, ".gitconfig", `[user]
+	name = Fixture User
+`)
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("GIT_CONFIG_GLOBAL", global)
+
+	config, err := LoadGlobal(context.Background())
+	if err != nil {
+		t.Fatalf("LoadGlobal failed: %v", err)
+	}
+	name, err := Get[string](config, "user.name")
+	if err != nil {
+		t.Fatalf("Get user.name failed: %v", err)
+	}
+	if name != "Fixture User" {
+		t.Fatalf("unexpected user.name: %q", name)
+	}
+}
+
+func TestLoadUsesScopePrecedence(t *testing.T) {
+	dir := t.TempDir()
+	global := writeFile(t, dir, "global.gitconfig", `[core]
+	editor = vim
+`)
+	repo := dir + "/repo"
+	writeFile(t, repo, ".git/config", `[core]
+	editor = nvim
+`)
+	t.Setenv("GIT_CONFIG_GLOBAL", global)
+
+	config, err := Load(
+		context.Background(),
+		WithScopes(ScopeGlobal, ScopeLocal),
+		WithRepoPath(repo),
+	)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	assertValue(t, config, "core.editor", "nvim")
+
+	values := config.Values("core.editor")
+	if len(values) != 2 || values[0] != "vim" || values[1] != "nvim" {
+		t.Fatalf("unexpected precedence values: %#v", values)
+	}
+}
+
+func TestLoadLocalDoesNotIncludeGlobal(t *testing.T) {
+	dir := t.TempDir()
+	global := writeFile(t, dir, "global.gitconfig", `[user]
+	name = Global User
+`)
+	repo := dir + "/repo"
+	writeFile(t, repo, ".git/config", `[core]
+	editor = nvim
+`)
+	t.Setenv("GIT_CONFIG_GLOBAL", global)
+
+	config, err := LoadLocal(context.Background(), repo)
+	if err != nil {
+		t.Fatalf("LoadLocal failed: %v", err)
+	}
+	if config.Has("user.name") {
+		t.Fatal("LoadLocal should not include global config")
+	}
+	assertValue(t, config, "core.editor", "nvim")
+}
+
+func TestReloadRefreshesOriginalSources(t *testing.T) {
+	dir := t.TempDir()
+	global := writeFile(t, dir, "global.gitconfig", `[core]
+	editor = vim
+`)
+	t.Setenv("GIT_CONFIG_GLOBAL", global)
+
+	config, err := LoadGlobal(context.Background())
+	if err != nil {
+		t.Fatalf("LoadGlobal failed: %v", err)
+	}
+	assertValue(t, config, "core.editor", "vim")
+
+	if err := os.WriteFile(global, []byte("[core]\neditor = nvim\n"), 0o644); err != nil {
+		t.Fatalf("rewrite global config: %v", err)
 	}
 
-	for _, test := range tests {
-		if test.sourceType.String() != test.expected {
-			t.Errorf("Expected '%s', got '%s'", test.expected, test.sourceType.String())
+	if err := config.Reload(context.Background()); err != nil {
+		t.Fatalf("Reload failed: %v", err)
+	}
+	assertValue(t, config, "core.editor", "nvim")
+}
+
+func TestConfigConcurrentReadReload(t *testing.T) {
+	dir := t.TempDir()
+	global := writeFile(t, dir, "global.gitconfig", `[core]
+	editor = vim
+`)
+	t.Setenv("GIT_CONFIG_GLOBAL", global)
+
+	config, err := LoadGlobal(context.Background())
+	if err != nil {
+		t.Fatalf("LoadGlobal failed: %v", err)
+	}
+
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-done:
+					return
+				default:
+					_, _ = config.Value("core.editor")
+					_ = config.Values("core.editor")
+					_ = config.Sections()
+				}
+			}
+		}()
+	}
+
+	for i := range 20 {
+		editor := "vim"
+		if i%2 == 1 {
+			editor = "nvim"
 		}
+		if err := os.WriteFile(global, []byte("[core]\neditor = "+editor+"\n"), 0o644); err != nil {
+			t.Fatalf("rewrite global config: %v", err)
+		}
+		if err := config.Reload(context.Background()); err != nil {
+			t.Fatalf("Reload failed: %v", err)
+		}
+	}
+
+	close(done)
+	wg.Wait()
+}
+
+func TestScopeString(t *testing.T) {
+	tests := map[Scope]string{
+		ScopeSystem:   "system",
+		ScopeGlobal:   "global",
+		ScopeLocal:    "local",
+		ScopeWorktree: "worktree",
+		Scope(99):     "unknown",
+	}
+
+	for scope, want := range tests {
+		if got := scope.String(); got != want {
+			t.Fatalf("Scope(%d).String() = %q, want %q", scope, got, want)
+		}
+	}
+}
+
+func mustAddEntry(t *testing.T, config *Config, key, value string, source Source) {
+	t.Helper()
+	if err := config.addEntry(key, value, source, 1); err != nil {
+		t.Fatalf("addEntry(%q) failed: %v", key, err)
 	}
 }

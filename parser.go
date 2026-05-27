@@ -6,398 +6,658 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
-	"unicode"
 )
 
+const (
+	includeSection  = "include"
+	includeIfPrefix = "includeif."
+
+	gitDirInsensitiveConditionPrefix = "gitdir/i:"
+	gitDirConditionPrefix            = "gitdir:"
+	onBranchConditionPrefix          = "onbranch:"
+)
+
+type parserOptions struct {
+	includeFiles bool
+	repoPath     string
+}
+
 type parser struct {
-	sectionRegex      *regexp.Regexp
-	keyValueRegex     *regexp.Regexp
-	commentRegex      *regexp.Regexp
-	continuationRegex *regexp.Regexp
+	opts parserOptions
 }
 
-func newParser() *parser {
-	return &parser{
-		sectionRegex:      regexp.MustCompile(`^\s*\[([^\]]+)\]\s*$`),
-		keyValueRegex:     regexp.MustCompile(`^\s*([^=\s]+)\s*=\s*(.*)$`),
-		commentRegex:      regexp.MustCompile(`^\s*[#;]`),
-		continuationRegex: regexp.MustCompile(`^\s+(.*)$`),
-	}
+type parseState struct {
+	stack map[string]bool
+	depth int
 }
 
-func (p *parser) parseFromGitCommand(ctx context.Context, opts *configOptions) (*Config, error) {
-	config := &Config{
-		sections: make(map[string]map[string]string),
-		sources:  make([]ConfigSource, 0),
+type parseFile struct {
+	cfg        *Config
+	source     Source
+	sourcePath string
+	state      *parseState
+	section    string
+}
+
+func newParser(opts parserOptions) *parser {
+	return &parser{opts: opts}
+}
+
+func newParseState() *parseState {
+	return &parseState{stack: make(map[string]bool)}
+}
+
+func (p *parser) parseFromFiles(ctx context.Context, opts options) (*Config, error) {
+	cfg := newConfig()
+	s := cfg.mutableState()
+	s.repoPath = opts.repoPath
+	s.includes = opts.includeFiles
+	s.useGit = false
+	sources := getConfigSources(opts)
+	cfg.setRoots(sources)
+
+	ps := newParseState()
+	for _, src := range sources {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if err := p.parseConfigFile(ctx, src.Path, src, cfg, ps); err != nil {
+			return nil, err
+		}
+	}
+	return cfg, nil
+}
+
+func (p *parser) parseFromGitCommand(ctx context.Context, opts options) (*Config, error) {
+	cfg := newConfig()
+	s := cfg.mutableState()
+	s.repoPath = opts.repoPath
+	s.includes = opts.includeFiles
+	s.useGit = true
+
+	sources := getConfigSources(opts)
+	cfg.setRoots(sources)
+	if len(sources) == 0 {
+		return cfg, nil
 	}
 
-	if opts.timeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, opts.timeout)
-		defer cancel()
+	seen := make(map[Scope]bool)
+	for _, src := range sources {
+		if seen[src.Scope] {
+			continue
+		}
+		seen[src.Scope] = true
+
+		out, err := p.runGitConfig(ctx, opts, src.Scope)
+		if err != nil {
+			return nil, err
+		}
+
+		for i, line := range strings.Split(strings.TrimRight(out, "\n"), "\n") {
+			if line == "" {
+				continue
+			}
+
+			sourcePath, key, value := parseGitConfigOutputLine(line)
+			if key == "" {
+				continue
+			}
+
+			entrySrc := Source{Scope: src.Scope, Path: sourcePath}
+			cfg.addSource(entrySrc)
+			if err := cfg.addEntry(key, value, entrySrc, i+1); err != nil {
+				return nil, &ConfigError{Op: "parse", Key: key, Source: sourcePath, Err: err}
+			}
+		}
 	}
 
-	args := []string{"config", "--list", "--null", "--show-origin"}
+	return cfg, nil
+}
 
-	sourceFlags := p.buildSourceFlags(opts)
-	if len(sourceFlags) > 0 {
-		args = append(args, sourceFlags...)
-	}
-
+func (p *parser) runGitConfig(ctx context.Context, opts options, scope Scope) (string, error) {
+	args := []string{"config", "--list", "--show-origin", gitConfigScopeFlag(scope)}
 	cmd := exec.CommandContext(ctx, "git", args...)
 	if opts.repoPath != "" {
 		cmd.Dir = opts.repoPath
 	}
 
-	output, err := cmd.Output()
+	out, err := cmd.Output()
 	if err != nil {
-		var exitError *exec.ExitError
-		if errors.As(err, &exitError) {
-			return nil, &ConfigError{
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			return "", &ConfigError{
 				Op:  "load",
-				Err: fmt.Errorf("git config failed: %s", string(exitError.Stderr)),
+				Err: fmt.Errorf("git config failed: %s", string(ee.Stderr)),
 			}
 		}
-		return nil, &ConfigError{
-			Op:  "load",
-			Err: fmt.Errorf("failed to execute git config: %w", err),
-		}
+		return "", &ConfigError{Op: "load", Err: fmt.Errorf("execute git config: %w", err)}
 	}
-
-	return p.parseGitConfigOutput(string(output), config)
+	return string(out), nil
 }
 
-func (p *parser) parseFromFiles(ctx context.Context, opts *configOptions) (*Config, error) {
-	config := &Config{
-		sections: make(map[string]map[string]string),
-		sources:  make([]ConfigSource, 0),
+func gitConfigScopeFlag(scope Scope) string {
+	switch scope {
+	case ScopeSystem:
+		return "--system"
+	case ScopeGlobal:
+		return "--global"
+	case ScopeLocal:
+		return "--local"
+	case ScopeWorktree:
+		return "--worktree"
+	default:
+		return "--global"
 	}
-
-	for _, source := range getAllConfigPaths(opts) {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
-		}
-
-		if err := p.parseConfigFile(source.Path, config); err != nil {
-			return nil, err
-		}
-		config.sources = append(config.sources, source)
-	}
-
-	return config, nil
 }
 
-func (p *parser) buildSourceFlags(opts *configOptions) []string {
-	var sourceFlags []string
-
-	if opts.includeSystem {
-		sourceFlags = append(sourceFlags, "--system")
-	}
-	if opts.includeGlobal {
-		sourceFlags = append(sourceFlags, "--global")
-	}
-	if opts.includeLocal {
-		sourceFlags = append(sourceFlags, "--local")
+func parseGitConfigOutputLine(line string) (sourcePath, key, value string) {
+	if head, rest, ok := strings.Cut(line, "\t"); ok {
+		if path, ok := strings.CutPrefix(head, "file:"); ok {
+			sourcePath = path
+		}
+		line = rest
 	}
 
-	return sourceFlags
+	key, value, ok := strings.Cut(line, "=")
+	if !ok {
+		return sourcePath, "", ""
+	}
+	return sourcePath, strings.TrimSpace(key), value
 }
 
-func (p *parser) parseGitConfigOutput(output string, config *Config) (*Config, error) {
-	lines := strings.Split(strings.TrimRight(output, "\x00"), "\x00")
-	for _, line := range lines {
-		if line == "" {
-			continue
-		}
-
-		key, value, source := p.parseGitConfigLine(line)
-		if key != "" {
-			if err := config.setRawValue(key, value); err != nil {
-				return nil, &ConfigError{
-					Op:     "parse",
-					Key:    key,
-					Source: source,
-					Err:    err,
-				}
-			}
-		}
+func (p *parser) parseConfigFile(
+	ctx context.Context,
+	path string,
+	source Source,
+	cfg *Config,
+	ps *parseState,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
-	return config, nil
-}
-
-func (p *parser) parseGitConfigLine(line string) (key, value, source string) {
-	// Parse show-origin format: "file:path\tkey=value"
-	if strings.HasPrefix(line, "file:") {
-		parts := strings.SplitN(line, "\t", 2)
-		if len(parts) == 2 {
-			source = strings.TrimPrefix(parts[0], "file:")
-			kvParts := strings.SplitN(parts[1], "=", 2)
-			if len(kvParts) == 2 {
-				key = strings.TrimSpace(kvParts[0])
-				value = kvParts[1]
-			}
-		}
-		return key, value, source
-	}
-
-	// Fallback for older git versions
-	parts := strings.SplitN(line, "=", 2)
-	if len(parts) == 2 {
-		key = strings.TrimSpace(parts[0])
-		value = parts[1]
-	}
-	return key, value, source
-}
-
-func (p *parser) parseConfigFile(path string, config *Config) error {
-	file, err := os.Open(path)
+	abs, err := filepath.Abs(path)
 	if err != nil {
+		return &ConfigError{Op: "parse", Source: path, Err: err}
+	}
+	source.Path = abs
+
+	if ps.stack[abs] {
+		return &ConfigError{Op: "parse", Source: abs, Err: ErrIncludeCycle}
+	}
+	if ps.depth > 100 {
 		return &ConfigError{
 			Op:     "parse",
-			Source: path,
-			Err:    fmt.Errorf("failed to open config file: %w", err),
+			Source: abs,
+			Err:    fmt.Errorf("%w: maximum include depth exceeded", ErrIncludeCycle),
 		}
 	}
-	defer file.Close()
 
-	return p.parseConfigReader(file, config, path)
+	f, err := os.Open(abs)
+	if err != nil {
+		return &ConfigError{Op: "parse", Source: abs, Err: fmt.Errorf("open config file: %w", err)}
+	}
+	defer f.Close()
+
+	cfg.addSource(source)
+	ps.stack[abs] = true
+	ps.depth++
+	defer func() {
+		ps.depth--
+		delete(ps.stack, abs)
+	}()
+
+	pf := &parseFile{
+		cfg:        cfg,
+		source:     source,
+		sourcePath: abs,
+		state:      ps,
+	}
+	return p.parseConfigReader(ctx, f, pf)
 }
 
-func (p *parser) parseConfigReader(reader io.Reader, config *Config, source string) error {
-	scanner := bufio.NewScanner(reader)
-	var currentSection string
-	lineNumber := 0
+func (p *parser) parseConfigReader(ctx context.Context, r io.Reader, pf *parseFile) error {
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
-	for scanner.Scan() {
-		lineNumber++
-		line := scanner.Text()
+	var pending string
+	start := 0
+	n := 0
 
-		if line == "" || p.commentRegex.MatchString(line) {
+	flush := func(line string, n int) error {
+		return p.parseLogicalLine(ctx, pf, line, n)
+	}
+
+	for sc.Scan() {
+		n++
+		line := sc.Text()
+		if pending == "" {
+			start = n
+			pending = line
+		} else {
+			pending += strings.TrimLeft(line, " \t")
+		}
+
+		if hasContinuation(pending) {
+			pending = pending[:len(pending)-1]
 			continue
 		}
 
-		if matches := p.sectionRegex.FindStringSubmatch(line); matches != nil {
-			currentSection = strings.TrimSpace(matches[1])
-			continue
+		if err := flush(pending, start); err != nil {
+			return err
 		}
+		pending = ""
+	}
 
-		if matches := p.keyValueRegex.FindStringSubmatch(line); matches != nil {
-			key := strings.TrimSpace(matches[1])
-			value := strings.TrimSpace(matches[2])
-
-			if processedValue, err := p.processQuotedValue(value); err != nil {
-				return &ConfigError{
-					Op:     "parse",
-					Key:    key,
-					Source: fmt.Sprintf("%s:%d", source, lineNumber),
-					Err:    fmt.Errorf("invalid quoted value: %w", err),
-				}
-			} else {
-				value = processedValue
-			}
-
-			fullKey := p.buildFullKey(currentSection, key)
-			if err := config.setRawValue(fullKey, value); err != nil {
-				return &ConfigError{
-					Op:     "parse",
-					Key:    fullKey,
-					Source: fmt.Sprintf("%s:%d", source, lineNumber),
-					Err:    err,
-				}
-			}
+	if pending != "" {
+		if err := flush(pending, start); err != nil {
+			return err
 		}
 	}
 
-	if err := scanner.Err(); err != nil {
+	if err := sc.Err(); err != nil {
 		return &ConfigError{
 			Op:     "parse",
-			Source: source,
-			Err:    fmt.Errorf("scanner error: %w", err),
+			Source: pf.sourcePath,
+			Err:    fmt.Errorf("scan config file: %w", err),
+		}
+	}
+	return nil
+}
+
+func (p *parser) parseLogicalLine(ctx context.Context, pf *parseFile, line string, n int) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	s := strings.TrimSpace(line)
+	if s == "" || strings.HasPrefix(s, "#") || strings.HasPrefix(s, ";") {
+		return nil
+	}
+
+	if strings.HasPrefix(s, "[") {
+		next, err := parseSectionHeader(strings.TrimSpace(stripInlineComment(s)))
+		if err != nil {
+			return &ConfigError{
+				Op:     "parse",
+				Source: fmt.Sprintf("%s:%d", pf.sourcePath, n),
+				Err:    err,
+			}
+		}
+		pf.section = next
+		return nil
+	}
+
+	key, value, err := parseAssignment(line)
+	if err != nil {
+		return &ConfigError{Op: "parse", Source: fmt.Sprintf("%s:%d", pf.sourcePath, n), Err: err}
+	}
+
+	key = buildFullKey(pf.section, key)
+	if err := pf.cfg.addEntry(key, value, pf.source, n); err != nil {
+		return &ConfigError{
+			Op:     "parse",
+			Key:    key,
+			Source: fmt.Sprintf("%s:%d", pf.sourcePath, n),
+			Err:    err,
+		}
+	}
+
+	if p.opts.includeFiles {
+		path, ok := p.includePath(key, value, pf.sourcePath)
+		if ok {
+			src := Source{Scope: pf.source.Scope, Path: path}
+			if err := p.parseConfigFile(ctx, path, src, pf.cfg, pf.state); err != nil {
+				if errors.Is(err, fs.ErrNotExist) {
+					return nil
+				}
+				return err
+			}
 		}
 	}
 
 	return nil
 }
 
-func (p *parser) processQuotedValue(value string) (string, error) {
-	if len(value) >= 2 && value[0] == '"' && value[len(value)-1] == '"' {
-		return strconv.Unquote(value)
+func parseSectionHeader(line string) (string, error) {
+	if !strings.HasSuffix(line, "]") {
+		return "", fmt.Errorf("%w: malformed section header", ErrInvalidKeyFormat)
 	}
-	return value, nil
+	s := strings.TrimSpace(line[1 : len(line)-1])
+	if s == "" {
+		return "", fmt.Errorf("%w: empty section", ErrInvalidKeyFormat)
+	}
+
+	base, rest, ok := strings.Cut(s, " ")
+	if !ok {
+		if !isValidSection(s) {
+			return "", fmt.Errorf("%w: invalid section", ErrInvalidKeyFormat)
+		}
+		return s, nil
+	}
+
+	base = strings.TrimSpace(base)
+	rest = strings.TrimSpace(rest)
+	if base == "" || rest == "" {
+		return "", fmt.Errorf("%w: malformed subsection", ErrInvalidKeyFormat)
+	}
+	if !strings.HasPrefix(rest, `"`) || !strings.HasSuffix(rest, `"`) {
+		return "", fmt.Errorf("%w: subsection must be quoted", ErrInvalidKeyFormat)
+	}
+	sub, err := strconv.Unquote(rest)
+	if err != nil {
+		return "", fmt.Errorf("unquote subsection: %w", err)
+	}
+	return base + "." + sub, nil
 }
 
-func (p *parser) buildFullKey(section, key string) string {
-	if section == "" {
-		return key
+func parseAssignment(line string) (key, value string, err error) {
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return "", "", ErrInvalidKeyFormat
 	}
 
-	// Handle subsections like remote "origin" -> remote.origin
-	if strings.Contains(section, " ") {
-		parts := strings.SplitN(section, " ", 2)
-		if len(parts) == 2 {
-			subsection := strings.TrimSpace(parts[1])
-			if len(subsection) >= 2 && subsection[0] == '"' && subsection[len(subsection)-1] == '"' {
-				return parts[0] + "." + subsection[1:len(subsection)-1] + "." + key
+	if k, v, ok := strings.Cut(line, "="); ok {
+		key = strings.TrimSpace(k)
+		value, err = parseValue(v)
+		if key == "" {
+			return "", "", ErrInvalidKeyFormat
+		}
+		return key, value, err
+	}
+
+	key = strings.TrimSpace(stripInlineComment(line))
+	if key == "" || strings.ContainsAny(key, " \t") {
+		return "", "", ErrInvalidKeyFormat
+	}
+	return key, "", nil
+}
+
+func parseValue(v string) (string, error) {
+	v = strings.TrimSpace(stripInlineComment(v))
+	if v == "" {
+		return "", nil
+	}
+	if strings.HasPrefix(v, `"`) {
+		if !strings.HasSuffix(v, `"`) {
+			return "", fmt.Errorf("%w: unterminated quoted value", ErrInvalidValue)
+		}
+		s, err := strconv.Unquote(v)
+		if err != nil {
+			return "", err
+		}
+		return s, nil
+	}
+	return v, nil
+}
+
+func stripInlineComment(s string) string {
+	quote := false
+	esc := false
+	for i, r := range s {
+		if esc {
+			esc = false
+			continue
+		}
+		switch r {
+		case '\\':
+			if quote {
+				esc = true
+			}
+		case '"':
+			quote = !quote
+		case '#', ';':
+			if !quote && (i == 0 || isSpace(s[i-1])) {
+				return s[:i]
 			}
 		}
 	}
+	return s
+}
 
+func buildFullKey(section, key string) string {
+	if section == "" {
+		return key
+	}
 	return section + "." + key
 }
 
-func isValidConfigKey(key string) bool {
-	if key == "" || !strings.Contains(key, ".") {
-		return false
+func hasContinuation(line string) bool {
+	n := 0
+	for i := len(line) - 1; i >= 0 && line[i] == '\\'; i-- {
+		n++
 	}
-	for _, r := range key {
-		if !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '.' && r != '-' && r != '_' {
-			return false
-		}
-	}
-	return true
+	return n%2 == 1
 }
 
-func isValidSectionName(name string) bool {
-	if name == "" {
-		return false
-	}
-
-	// Handle subsections like remote "origin"
-	if strings.Contains(name, " ") {
-		parts := strings.SplitN(name, " ", 2)
-		if len(parts) != 2 || !isValidKeyName(parts[0]) {
-			return false
-		}
-		subsection := strings.TrimSpace(parts[1])
-		return len(subsection) >= 2 && subsection[0] == '"' && subsection[len(subsection)-1] == '"'
-	}
-
-	return isValidKeyName(name)
+func isSpace(b byte) bool {
+	return b == ' ' || b == '\t'
 }
 
-func isValidSubsectionName(name string) bool {
-	if name == "" || !strings.Contains(name, ".") {
-		return false
+func (p *parser) includePath(key, value, sourcePath string) (string, bool) {
+	section, name, err := splitConfigKey(key)
+	if err != nil || !strings.EqualFold(name, "path") {
+		return "", false
 	}
-	for _, part := range strings.Split(name, ".") {
-		if !isValidKeyName(part) {
-			return false
+
+	switch {
+	case strings.EqualFold(section, includeSection):
+		return resolveIncludePath(value, sourcePath), true
+	case hasIncludeIfPrefix(section):
+		cond := section[len(includeIfPrefix):]
+		if p.matchIncludeCondition(cond) {
+			return resolveIncludePath(value, sourcePath), true
 		}
 	}
-	return true
+	return "", false
 }
 
-func isValidKeyName(name string) bool {
-	if name == "" {
-		return false
-	}
-
-	for _, r := range name {
-		if !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '-' && r != '_' {
-			return false
-		}
-	}
-
-	return true
+func hasIncludeIfPrefix(section string) bool {
+	return len(section) > len(includeIfPrefix) &&
+		strings.EqualFold(section[:len(includeIfPrefix)], includeIfPrefix)
 }
 
-func parseBool(value string) (bool, error) {
-	if value == "" {
-		return true, nil // Git treats empty values as true
+func resolveIncludePath(path, sourcePath string) string {
+	path = expandHome(path)
+	if filepath.IsAbs(path) {
+		return filepath.Clean(path)
 	}
-
-	lower := strings.ToLower(strings.TrimSpace(value))
-	switch lower {
-	case "true", "yes", "on", "1":
-		return true, nil
-	case "false", "no", "off", "0":
-		return false, nil
-	default:
-		return false, fmt.Errorf("invalid boolean value: %s", value)
-	}
+	return filepath.Clean(filepath.Join(filepath.Dir(sourcePath), path))
 }
 
-func convertValue[T Constraint](value string) (T, error) {
-	var result any
-	var err error
-
-	switch any(*new(T)).(type) {
-	case string:
-		result = value
-	case int:
-		result, err = strconv.Atoi(value)
-	case int8:
-		var v int64
-		v, err = strconv.ParseInt(value, 10, 8)
-		if err == nil {
-			result = int8(v)
-		}
-	case int16:
-		var v int64
-		v, err = strconv.ParseInt(value, 10, 16)
-		if err == nil {
-			result = int16(v)
-		}
-	case int32:
-		var v int64
-		v, err = strconv.ParseInt(value, 10, 32)
-		if err == nil {
-			result = int32(v)
-		}
-	case int64:
-		result, err = strconv.ParseInt(value, 10, 64)
-	case uint:
-		var v uint64
-		v, err = strconv.ParseUint(value, 10, 0)
-		if err == nil {
-			result = uint(v)
-		}
-	case uint8:
-		var v uint64
-		v, err = strconv.ParseUint(value, 10, 8)
-		if err == nil {
-			result = uint8(v)
-		}
-	case uint16:
-		var v uint64
-		v, err = strconv.ParseUint(value, 10, 16)
-		if err == nil {
-			result = uint16(v)
-		}
-	case uint32:
-		var v uint64
-		v, err = strconv.ParseUint(value, 10, 32)
-		if err == nil {
-			result = uint32(v)
-		}
-	case uint64:
-		result, err = strconv.ParseUint(value, 10, 64)
-	case float32:
-		var v float64
-		v, err = strconv.ParseFloat(value, 32)
-		if err == nil {
-			result = float32(v)
-		}
-	case float64:
-		result, err = strconv.ParseFloat(value, 64)
-	case bool:
-		result, err = parseBool(value)
-	default:
-		err = fmt.Errorf("unsupported type")
+func expandHome(path string) string {
+	if path != "~" && !strings.HasPrefix(path, "~/") {
+		return path
 	}
-
+	home, err := os.UserHomeDir()
 	if err != nil {
-		var zero T
-		return zero, fmt.Errorf("%w: %v", ErrInvalidValue, err)
+		return path
+	}
+	if path == "~" {
+		return home
+	}
+	return filepath.Join(home, path[2:])
+}
+
+func (p *parser) matchIncludeCondition(cond string) bool {
+	s := strings.ToLower(cond)
+	switch {
+	case strings.HasPrefix(s, gitDirInsensitiveConditionPrefix):
+		return p.matchGitDir(cond[len(gitDirInsensitiveConditionPrefix):], true)
+	case strings.HasPrefix(s, gitDirConditionPrefix):
+		return p.matchGitDir(cond[len(gitDirConditionPrefix):], false)
+	case strings.HasPrefix(s, onBranchConditionPrefix):
+		return p.matchBranch(cond[len(onBranchConditionPrefix):])
+	default:
+		return false
+	}
+}
+
+func (p *parser) matchGitDir(pattern string, insensitive bool) bool {
+	if p.opts.repoPath == "" {
+		return false
 	}
 
-	return result.(T), nil
+	repo, err := filepath.Abs(p.opts.repoPath)
+	if err != nil {
+		return false
+	}
+	gitDir, err := findGitDir(repo)
+	if err != nil {
+		return false
+	}
+
+	pattern = normalizeSlash(expandHome(pattern))
+	if !filepath.IsAbs(filepath.FromSlash(pattern)) && !strings.ContainsAny(pattern, "*?[") {
+		if abs, err := filepath.Abs(filepath.FromSlash(pattern)); err == nil {
+			pattern = normalizeSlash(abs)
+		}
+	}
+
+	candidates := []string{
+		ensureTrailingSlash(normalizeSlash(repo)),
+		ensureTrailingSlash(normalizeSlash(gitDir)),
+	}
+
+	if insensitive {
+		pattern = strings.ToLower(pattern)
+	}
+	for _, c := range candidates {
+		if insensitive {
+			c = strings.ToLower(c)
+		}
+		if matchPathPattern(pattern, c) {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *parser) matchBranch(pattern string) bool {
+	if p.opts.repoPath == "" {
+		return false
+	}
+
+	branch, err := currentBranch(p.opts.repoPath)
+	if err != nil {
+		return false
+	}
+	return matchPathPattern(normalizeSlash(pattern), normalizeSlash(branch))
+}
+
+func currentBranch(repoPath string) (string, error) {
+	gitDir, err := findGitDir(repoPath)
+	if err != nil {
+		return "", err
+	}
+	b, err := os.ReadFile(filepath.Join(gitDir, "HEAD"))
+	if err != nil {
+		return "", err
+	}
+	s := strings.TrimSpace(string(b))
+	ref, ok := strings.CutPrefix(s, "ref: refs/heads/")
+	if !ok {
+		return "", errors.New("detached HEAD")
+	}
+	return ref, nil
+}
+
+func matchPathPattern(pattern, value string) bool {
+	pattern = normalizeSlash(pattern)
+	value = normalizeSlash(value)
+
+	if !strings.ContainsAny(pattern, "*?[") {
+		if strings.HasSuffix(pattern, "/") {
+			return strings.HasPrefix(value, pattern)
+		}
+		return strings.TrimSuffix(value, "/") == strings.TrimSuffix(pattern, "/")
+	}
+
+	re, err := regexp.Compile(globToRegexp(pattern))
+	if err != nil {
+		return false
+	}
+	return re.MatchString(value)
+}
+
+func globToRegexp(pattern string) string {
+	var b strings.Builder
+	b.WriteString("^")
+	for i := 0; i < len(pattern); i++ {
+		switch pattern[i] {
+		case '*':
+			if i+1 < len(pattern) && pattern[i+1] == '*' {
+				b.WriteString(".*")
+				i++
+			} else {
+				b.WriteString("[^/]*")
+			}
+		case '?':
+			b.WriteString("[^/]")
+		case '[':
+			end := globClassEnd(pattern, i+1)
+			if end == -1 {
+				b.WriteString(`\[`)
+				continue
+			}
+			b.WriteString(globClassToRegexp(pattern[i+1 : end]))
+			i = end
+		default:
+			b.WriteString(regexp.QuoteMeta(pattern[i : i+1]))
+		}
+	}
+	b.WriteString("$")
+	return b.String()
+}
+
+func globClassEnd(pattern string, start int) int {
+	for i := start; i < len(pattern); i++ {
+		if pattern[i] == ']' && i > start {
+			return i
+		}
+	}
+	return -1
+}
+
+func globClassToRegexp(class string) string {
+	var b strings.Builder
+	b.WriteByte('[')
+	if strings.HasPrefix(class, "!") {
+		b.WriteByte('^')
+		class = class[1:]
+	} else if strings.HasPrefix(class, "^") {
+		b.WriteString(`\^`)
+		class = class[1:]
+	}
+
+	for i := 0; i < len(class); i++ {
+		switch class[i] {
+		case '\\':
+			b.WriteString(`\\`)
+		case '[':
+			b.WriteString(`\[`)
+		default:
+			b.WriteByte(class[i])
+		}
+	}
+	b.WriteByte(']')
+	return b.String()
+}
+
+func normalizeSlash(path string) string {
+	return filepath.ToSlash(filepath.Clean(path))
+}
+
+func ensureTrailingSlash(path string) string {
+	if strings.HasSuffix(path, "/") {
+		return path
+	}
+	return path + "/"
 }

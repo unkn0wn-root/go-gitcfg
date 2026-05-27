@@ -4,116 +4,103 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 )
 
 const (
-	SystemConfigFile = "/etc/gitconfig"         // default system configuration file path.
-	GlobalConfigFile = ".gitconfig"             // default global configuration file name.
-	LocalConfigFile = ".git/config"             // default local configuration file path.
-	WorktreeConfigFile = ".git/config.worktree" // default worktree configuration file path.
-	XDGConfigDir = ".config/git/config"         // XDG configuration directory.
+	// SystemConfigFile is the default system configuration path.
+	SystemConfigFile = "/etc/gitconfig"
+	// GlobalConfigFile is the default home relative global configuration file.
+	GlobalConfigFile = ".gitconfig"
+	// LocalConfigFile is the repository gitdir configuration file.
+	LocalConfigFile = "config"
+	// WorktreeConfigFile is the repository gitdir worktree configuration file.
+	WorktreeConfigFile = "config.worktree"
+	// XDGConfigFile is the home-relative XDG global configuration file.
+	XDGConfigFile = ".config/git/config"
 )
 
-func validateRepoPath(path string) error {
-	if path == "" {
-		return errors.New("empty path")
-	}
-
-	info, err := os.Stat(path)
-	if err != nil {
-		return fmt.Errorf("path does not exist: %w", err)
-	}
-
-	if !info.IsDir() {
-		return errors.New("path is not a directory")
-	}
-
-	gitDir := filepath.Join(path, ".git")
-	if _, err := os.Stat(gitDir); err != nil {
-		return errors.New("not a Git repository")
-	}
-
-	return nil
-}
-
-func getSystemConfigPath() string {
-	// Try to get from git config --system --list first
-	if path := getSystemConfigPathFromGit(); path != "" {
-		return path
-	}
-
-	return getSystemConfigPathFallback()
-}
-
-func getSystemConfigPathFromGit() string {
-    cmd := exec.Command("git", "config", "--system", "--show-origin", "--list")
-	output, err := cmd.Output()
-	if err != nil {
-		return ""
-	}
-
-	return parseSystemConfigPath(string(output))
-}
-
-func parseSystemConfigPath(output string) string {
-	lines := strings.Split(output, "\n")
-	for _, line := range lines {
-		if strings.HasPrefix(line, "file:") {
-			parts := strings.SplitN(line, "\t", 2)
-			if len(parts) > 0 {
-				return strings.TrimPrefix(parts[0], "file:")
+func getConfigSources(opts options) []Source {
+	var srcs []Source
+	for _, s := range opts.scopes {
+		switch s {
+		case ScopeSystem:
+			for _, p := range getSystemConfigPaths() {
+				srcs = append(srcs, Source{Scope: ScopeSystem, Path: p})
+			}
+		case ScopeGlobal:
+			for _, p := range getGlobalConfigPaths() {
+				srcs = append(srcs, Source{Scope: ScopeGlobal, Path: p})
+			}
+		case ScopeLocal:
+			if p := getLocalConfigPath(opts.repoPath); p != "" {
+				srcs = append(srcs, Source{Scope: ScopeLocal, Path: p})
+			}
+		case ScopeWorktree:
+			if p := getWorktreeConfigPath(opts.repoPath); p != "" {
+				srcs = append(srcs, Source{Scope: ScopeWorktree, Path: p})
 			}
 		}
 	}
-	return ""
+	return srcs
 }
 
-func getSystemConfigPathFallback() string {
-	paths := []string{
-		SystemConfigFile,
-		"/usr/local/etc/gitconfig",
+func getSystemConfigPaths() []string {
+	if os.Getenv("GIT_CONFIG_NOSYSTEM") != "" {
+		return nil
+	}
+	if p := os.Getenv("GIT_CONFIG_SYSTEM"); p != "" {
+		if fileExists(p) {
+			return []string{p}
+		}
+		return nil
 	}
 
-	for _, path := range paths {
-		if _, err := os.Stat(path); err == nil {
-			return path
+	var ps []string
+	for _, p := range []string{SystemConfigFile, "/usr/local/etc/gitconfig"} {
+		if fileExists(p) {
+			ps = append(ps, p)
 		}
 	}
-
-	return ""
+	return ps
 }
 
-func getGlobalConfigPath() string {
-	if path := getXDGConfigPath(); path != "" {
-		return path
+func getGlobalConfigPaths() []string {
+	if p := os.Getenv("GIT_CONFIG_GLOBAL"); p != "" {
+		if fileExists(p) {
+			return []string{p}
+		}
+		return nil
 	}
 
-	if path := getHomeConfigPath(); path != "" {
-		return path
+	var ps []string
+	if p := getXDGConfigPath(); p != "" {
+		ps = append(ps, p)
 	}
-
-	return ""
+	if p := getHomeConfigPath(); p != "" {
+		ps = append(ps, p)
+	}
+	return ps
 }
 
 func getXDGConfigPath() string {
-	xdgConfig := os.Getenv("XDG_CONFIG_HOME")
-	if xdgConfig != "" {
-		xdgPath := filepath.Join(xdgConfig, "git", "config")
-		if _, err := os.Stat(xdgPath); err == nil {
-			return xdgPath
+	if dir := os.Getenv("XDG_CONFIG_HOME"); dir != "" {
+		p := filepath.Join(dir, "git", "config")
+		if fileExists(p) {
+			return p
 		}
+		return ""
 	}
 
-	if home, err := os.UserHomeDir(); err == nil {
-		xdgPath := filepath.Join(home, XDGConfigDir)
-		if _, err := os.Stat(xdgPath); err == nil {
-			return xdgPath
-		}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
 	}
-
+	p := filepath.Join(home, XDGConfigFile)
+	if fileExists(p) {
+		return p
+	}
 	return ""
 }
 
@@ -122,79 +109,92 @@ func getHomeConfigPath() string {
 	if err != nil {
 		return ""
 	}
-
-	globalPath := filepath.Join(home, GlobalConfigFile)
-	if _, err := os.Stat(globalPath); err == nil {
-		return globalPath
+	p := filepath.Join(home, GlobalConfigFile)
+	if fileExists(p) {
+		return p
 	}
-
 	return ""
 }
 
 func getLocalConfigPath(repoPath string) string {
-	if repoPath == "" {
+	dir, err := findGitDir(repoPath)
+	if err != nil {
 		return ""
 	}
-
-	localPath := filepath.Join(repoPath, LocalConfigFile)
-	if _, err := os.Stat(localPath); err == nil {
-		return localPath
+	p := filepath.Join(dir, LocalConfigFile)
+	if fileExists(p) {
+		return p
 	}
-
 	return ""
 }
 
 func getWorktreeConfigPath(repoPath string) string {
-	if repoPath == "" {
+	dir, err := findGitDir(repoPath)
+	if err != nil {
 		return ""
 	}
-
-	worktreePath := filepath.Join(repoPath, WorktreeConfigFile)
-	if _, err := os.Stat(worktreePath); err == nil {
-		return worktreePath
+	p := filepath.Join(dir, WorktreeConfigFile)
+	if fileExists(p) {
+		return p
 	}
-
 	return ""
 }
 
-func getAllConfigPaths(opts *configOptions) []ConfigSource {
-	var sources []ConfigSource
-
-	if opts.includeSystem {
-		if path := getSystemConfigPath(); path != "" {
-			sources = append(sources, ConfigSource{
-				Type: SourceTypeSystem,
-				Path: path,
-			})
-		}
+func findGitDir(repoPath string) (string, error) {
+	if strings.TrimSpace(repoPath) == "" {
+		return "", errors.New("empty path")
 	}
 
-	if opts.includeGlobal {
-		if path := getGlobalConfigPath(); path != "" {
-			sources = append(sources, ConfigSource{
-				Type: SourceTypeGlobal,
-				Path: path,
-			})
-		}
+	repoPath, err := filepath.Abs(repoPath)
+	if err != nil {
+		return "", err
 	}
 
-	if opts.includeLocal && opts.repoPath != "" {
-		if path := getLocalConfigPath(opts.repoPath); path != "" {
-			sources = append(sources, ConfigSource{
-				Type: SourceTypeLocal,
-				Path: path,
-			})
-		}
+	fi, err := os.Stat(repoPath)
+	if err != nil {
+		return "", fmt.Errorf("path does not exist: %w", err)
+	}
+	if !fi.IsDir() {
+		return "", errors.New("path is not a directory")
 	}
 
-	if opts.includeWorktree && opts.repoPath != "" {
-		if path := getWorktreeConfigPath(opts.repoPath); path != "" {
-			sources = append(sources, ConfigSource{
-				Type: SourceTypeWorktree,
-				Path: path,
-			})
-		}
+	gitPath := filepath.Join(repoPath, ".git")
+	fi, err = os.Stat(gitPath)
+	if err != nil {
+		return "", errors.New("not a Git repository")
+	}
+	if fi.IsDir() {
+		return gitPath, nil
 	}
 
-	return sources
+	b, err := os.ReadFile(gitPath)
+	if err != nil {
+		return "", fmt.Errorf("read .git file: %w", err)
+	}
+
+	s := strings.TrimSpace(string(b))
+	dir, ok := strings.CutPrefix(s, "gitdir:")
+	if !ok {
+		return "", errors.New("invalid .git file")
+	}
+
+	dir = strings.TrimSpace(dir)
+	if !filepath.IsAbs(dir) {
+		dir = filepath.Join(repoPath, dir)
+	}
+
+	dir = filepath.Clean(dir)
+	fi, err = os.Stat(dir)
+	if err != nil {
+		return "", fmt.Errorf("gitdir does not exist: %w", err)
+	}
+	if !fi.IsDir() {
+		return "", errors.New("gitdir is not a directory")
+	}
+	return dir, nil
+}
+
+func fileExists(path string) bool {
+	fi, err := os.Stat(path)
+	return err == nil && !fi.IsDir()
 }
