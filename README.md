@@ -7,7 +7,7 @@ It uses a pure Go parser by default, preserves repeated keys, follows Git config
 ## Install
 
 ```sh
-go get github.com/unkn0wn-root/gitcfg
+go get github.com/unkn0wn-root/go-gitcfg
 ```
 
 ## Quick Start
@@ -19,7 +19,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/unkn0wn-root/gitcfg"
+	"github.com/unkn0wn-root/go-gitcfg"
 )
 
 func main() {
