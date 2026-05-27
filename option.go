@@ -1,83 +1,75 @@
 package gitcfg
 
 import (
-    "fmt"
-    "time"
-    "context"
+	"context"
+	"fmt"
+	"time"
 )
 
+// DefaultTimeout is the default timeout used by Load.
 const DefaultTimeout = 30 * time.Second
 
-type configOptions struct {
-	includeSystem   bool
-	includeGlobal   bool
-	includeLocal    bool
-	includeWorktree bool
-	repoPath        string
-	useGitCommand   bool
-	timeout         time.Duration
+type options struct {
+	scopes       []Scope
+	repoPath     string
+	includeFiles bool
+	useGit       bool
+	timeout      time.Duration
 }
 
-type ConfigOption func(*configOptions)
+// Option configures Load.
+type Option func(*options)
 
-func WithSystem() ConfigOption {
-	return func(opts *configOptions) {
-		opts.includeSystem = true
+// WithScopes selects the Git configuration scopes to load.
+func WithScopes(scopes ...Scope) Option {
+	return func(o *options) {
+		o.scopes = append(o.scopes[:0], scopes...)
 	}
 }
 
-func WithGlobal() ConfigOption {
-	return func(opts *configOptions) {
-		opts.includeGlobal = true
+// WithRepoPath sets the repository path used for local/worktree scopes and includeIf evaluation.
+func WithRepoPath(path string) Option {
+	return func(o *options) {
+		o.repoPath = path
 	}
 }
 
-func WithLocal() ConfigOption {
-	return func(opts *configOptions) {
-		opts.includeLocal = true
+// WithIncludes enables or disables include.path and includeIf handling.
+func WithIncludes(enabled bool) Option {
+	return func(o *options) {
+		o.includeFiles = enabled
 	}
 }
 
-func WithWorktree() ConfigOption {
-	return func(opts *configOptions) {
-		opts.includeWorktree = true
+// WithTimeout sets the maximum time spent loading configuration.
+func WithTimeout(timeout time.Duration) Option {
+	return func(o *options) {
+		o.timeout = timeout
 	}
 }
 
-func WithRepoPath(path string) ConfigOption {
-	return func(opts *configOptions) {
-		opts.repoPath = path
+// WithGitCommand loads configuration by invoking git config instead of the pure-Go parser.
+func WithGitCommand() Option {
+	return func(o *options) {
+		o.useGit = true
 	}
 }
 
-func WithGitCommand() ConfigOption {
-	return func(opts *configOptions) {
-		opts.useGitCommand = true
-	}
-}
-
-func WithTimeout(timeout time.Duration) ConfigOption {
-	return func(opts *configOptions) {
-		opts.timeout = timeout
-	}
-}
-
-func Load(opts ...ConfigOption) (*Config, error) {
-	return LoadWithContext(context.Background(), opts...)
-}
-
-func LoadWithContext(ctx context.Context, opts ...ConfigOption) (*Config, error) {
-	options := &configOptions{
-		includeGlobal: true, // Default to global config
-		timeout:       DefaultTimeout,
-	}
-
+// Load reads Git configuration according to opts.
+func Load(ctx context.Context, opts ...Option) (*Config, error) {
+	o := defaultOptions()
 	for _, opt := range opts {
-		opt(options)
+		opt(&o)
 	}
 
-	if (options.includeLocal || options.includeWorktree) && options.repoPath != "" {
-		if err := validateRepoPath(options.repoPath); err != nil {
+	if o.timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, o.timeout)
+		defer cancel()
+	}
+
+	if needsRepo(o.scopes) {
+		if _, err := findGitDir(o.repoPath); err != nil {
 			return nil, &ConfigError{
 				Op:  "load",
 				Err: fmt.Errorf("invalid repository path: %w", err),
@@ -85,34 +77,49 @@ func LoadWithContext(ctx context.Context, opts ...ConfigOption) (*Config, error)
 		}
 	}
 
-	parser := newParser()
-	if options.useGitCommand {
-		return parser.parseFromGitCommand(ctx, options)
+	p := newParser(parserOptions{
+		includeFiles: o.includeFiles,
+		repoPath:     o.repoPath,
+	})
+
+	if o.useGit {
+		return p.parseFromGitCommand(ctx, o)
 	}
-
-	return parser.parseFromFiles(ctx, options)
+	return p.parseFromFiles(ctx, o)
 }
 
-func LoadGlobal() (*Config, error) {
-	return Load(WithGlobal())
+// LoadGlobal loads user-level Git configuration.
+func LoadGlobal(ctx context.Context) (*Config, error) {
+	return Load(ctx, WithScopes(ScopeGlobal))
 }
 
-func LoadLocal(repoPath string) (*Config, error) {
-	return Load(WithLocal(), WithRepoPath(repoPath))
+// LoadLocal loads repository-local Git configuration.
+func LoadLocal(ctx context.Context, repoPath string) (*Config, error) {
+	return Load(ctx, WithScopes(ScopeLocal), WithRepoPath(repoPath))
 }
 
-func LoadAll(repoPath string) (*Config, error) {
-	return Load(WithSystem(), WithGlobal(), WithLocal(), WithWorktree(), WithRepoPath(repoPath))
+// LoadAll loads system, global, local, and worktree configuration in precedence order.
+func LoadAll(ctx context.Context, repoPath string) (*Config, error) {
+	return Load(
+		ctx,
+		WithScopes(ScopeSystem, ScopeGlobal, ScopeLocal, ScopeWorktree),
+		WithRepoPath(repoPath),
+	)
 }
 
-func LoadGlobalWithContext(ctx context.Context) (*Config, error) {
-	return LoadWithContext(ctx, WithGlobal())
+func defaultOptions() options {
+	return options{
+		scopes:       []Scope{ScopeGlobal},
+		includeFiles: true,
+		timeout:      DefaultTimeout,
+	}
 }
 
-func LoadLocalWithContext(ctx context.Context, repoPath string) (*Config, error) {
-	return LoadWithContext(ctx, WithLocal(), WithRepoPath(repoPath))
-}
-
-func LoadAllWithContext(ctx context.Context, repoPath string) (*Config, error) {
-	return LoadWithContext(ctx, WithSystem(), WithGlobal(), WithLocal(), WithWorktree(), WithRepoPath(repoPath))
+func needsRepo(scopes []Scope) bool {
+	for _, s := range scopes {
+		if s == ScopeLocal || s == ScopeWorktree {
+			return true
+		}
+	}
+	return false
 }
